@@ -22,6 +22,26 @@ python3 scripts/fasta_art_pipeline.py \
   --temperature 1.8
 ```
 
+### 3) 使用 ESM2 (650M) embedding 驱动抽象艺术渲染
+先执行环境与模型链接脚本（会在 `artifacts/models/` 下创建软链接）：
+```bash
+bash scripts/setup_esm2_env.sh \
+  /tos-mlp-zgci/lichengping/esm2_t33_650M_UR50D \
+  /vepfs-mlp2/mlp-public/lichengping/conda_envs/AI4Art
+```
+
+然后运行：
+```bash
+python3 scripts/fasta_art_pipeline.py \
+  --fasta /path/to/protein.fasta \
+  --use-esm2 \
+  --esm2-model-dir artifacts/models/esm2_t33_650M_UR50D \
+  --embedding-device cuda \
+  --temperature 1.9 \
+  --noise-scale 0.08 \
+  --max-grid-size 1536
+```
+
 输出：
 - 图像：`artifacts/images/fasta_art/*.png`
 - 元数据：`artifacts/metadata/*.json`
