@@ -28,6 +28,13 @@ from urllib.request import urlopen
 import matplotlib.pyplot as plt
 import numpy as np
 
+try:
+    import torch
+    from esm import pretrained as esm_pretrained
+except ImportError:  # optional runtime dependency
+    torch = None
+    esm_pretrained = None
+
 
 ALPHABET_DNA = set("ACGTN")
 ALPHABET_PROTEIN = set("ACDEFGHIKLMNPQRSTVWYBXZJUO")
@@ -48,6 +55,7 @@ class ArtMetadata:
     noise_scale: float
     top_n_kmers: int
     seed: int
+    esm2_model_path: str | None
     top_kmers: list[tuple[str, int]]
     output_image: str
 
@@ -124,11 +132,45 @@ def kmer_hist(seq: str, k: int, top_n: int) -> list[tuple[str, int]]:
     return kmers.most_common(top_n)
 
 
-def render_art(seq: str, ent: np.ndarray, kmers: list[tuple[str, int]], temperature: float, noise_scale: float, seed: int) -> np.ndarray:
+def resolve_esm2_model_path(model_dir: Path) -> Path:
+    if model_dir.is_file():
+        return model_dir
+    candidates = sorted(model_dir.glob("*.pt"))
+    if not candidates:
+        raise FileNotFoundError(f"No .pt checkpoint found under: {model_dir}")
+    return candidates[0]
+
+
+def esm2_embedding(seq: str, model_path: Path, device: str = "cpu") -> np.ndarray:
+    if torch is None or esm_pretrained is None:
+        raise RuntimeError("ESM2 dependencies missing. Install `torch` and `fair-esm` first.")
+    model, alphabet = esm_pretrained.load_model_and_alphabet_local(str(model_path))
+    model.eval()
+    model = model.to(device)
+    batch_converter = alphabet.get_batch_converter()
+    _, _, batch_tokens = batch_converter([("query", seq)])
+    batch_tokens = batch_tokens.to(device)
+    with torch.no_grad():
+        result = model(batch_tokens, repr_layers=[33], return_contacts=False)
+    token_repr = result["representations"][33][0, 1 : len(seq) + 1]
+    emb = token_repr.mean(0).detach().cpu().numpy().astype(np.float32)
+    return emb
+
+
+def render_art(
+    seq: str,
+    ent: np.ndarray,
+    kmers: list[tuple[str, int]],
+    temperature: float,
+    noise_scale: float,
+    seed: int,
+    max_grid_size: int,
+) -> np.ndarray:
     random.seed(seed)
     np.random.seed(seed)
 
     n = max(64, int(np.sqrt(len(seq))) * 4)
+    n = min(n, max_grid_size)
     grid = np.zeros((n, n, 3), dtype=float)
 
     # Base color field from entropy stripes
@@ -155,6 +197,36 @@ def render_art(seq: str, ent: np.ndarray, kmers: list[tuple[str, int]], temperat
     mix = min(0.95, max(0.0, (temperature - 0.7) / 2.0))
     grid = (1 - mix) * grid + mix * grid[..., [2, 0, 1]]
     return np.clip(grid, 0, 1)
+
+
+def render_embedding_art(embedding: np.ndarray, n: int, temperature: float, noise_scale: float, seed: int) -> np.ndarray:
+    random.seed(seed)
+    np.random.seed(seed)
+    y, x = np.mgrid[-1:1:complex(0, n), -1:1:complex(0, n)]
+    r = np.sqrt(x * x + y * y)
+    theta = np.arctan2(y, x)
+
+    harmonics = np.abs(embedding[:12]) if embedding.size >= 12 else np.pad(np.abs(embedding), (0, max(0, 12 - embedding.size)))
+    harmonics = harmonics / max(1e-6, harmonics.max(initial=1.0))
+    field = np.zeros_like(r)
+    for i, amp in enumerate(harmonics, start=1):
+        freq = i * (1.0 + 0.7 * temperature)
+        phase = (embedding[i % embedding.size] if embedding.size else 0.0) * math.pi
+        field += amp * np.sin(freq * theta + (freq * 2.5) * r + phase)
+    field = (field - field.min()) / max(1e-6, field.max() - field.min())
+
+    palette = np.array(
+        [
+            0.55 + 0.45 * np.sin(2 * math.pi * field + temperature),
+            0.50 + 0.50 * np.sin(2 * math.pi * field + 2.1),
+            0.45 + 0.55 * np.cos(2 * math.pi * field + 4.3),
+        ]
+    ).transpose(1, 2, 0)
+
+    noise = np.random.normal(0, noise_scale * max(0.3, temperature), size=palette.shape)
+    vignette = np.clip(1.2 - r**1.7, 0, 1)[..., None]
+    art = np.clip((palette + noise) * vignette + 0.08, 0, 1)
+    return art
 
 
 def save_figure(arr: np.ndarray, output: Path, title: str, annotation: str) -> None:
@@ -184,7 +256,16 @@ def main() -> None:
     parser.add_argument("--noise-scale", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--manifest", type=Path, default=Path("artifacts/metadata/art_manifest.tsv"))
+    parser.add_argument("--max-grid-size", type=int, default=2048, help="Maximum render grid width/height to control memory use.")
+    parser.add_argument("--use-esm2", action="store_true", help="Use ESM2 embedding-driven renderer.")
+    parser.add_argument("--esm2-model-dir", type=Path, default=None, help="Path to ESM2 checkpoint dir or .pt file.")
+    parser.add_argument("--embedding-device", default="cpu", help="Torch device for ESM2 embedding, e.g. cpu/cuda.")
     args = parser.parse_args()
+
+    if args.max_grid_size < 64:
+        raise SystemExit("--max-grid-size must be >= 64.")
+    if args.use_esm2 and args.esm2_model_dir is None:
+        raise SystemExit("When --use-esm2 is set, provide --esm2-model-dir.")
 
     fasta_path = args.fasta
     if args.accessions:
@@ -197,6 +278,7 @@ def main() -> None:
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
 
     manifest_lines = ["image_path\taccession\tsequence_id\tseq_type\tlength\tncbi_db\ttemperature\tnoise_scale\tseed"]
+    esm2_model_path = resolve_esm2_model_path(args.esm2_model_dir) if args.use_esm2 else None
 
     for idx, (header, seq) in enumerate(parse_fasta(fasta_path), start=1):
         seq_type = infer_seq_type(seq)
@@ -204,7 +286,20 @@ def main() -> None:
         ent = entropy_profile(seq, args.patch)
         kmers = kmer_hist(seq, args.k, args.top_n_kmers)
 
-        art = render_art(seq, ent, kmers, args.temperature, args.noise_scale, args.seed + idx)
+        n = min(max(64, int(np.sqrt(len(seq))) * 4), args.max_grid_size)
+        if args.use_esm2:
+            embedding = esm2_embedding(seq, esm2_model_path, device=args.embedding_device)
+            art = render_embedding_art(embedding, n, args.temperature, args.noise_scale, args.seed + idx)
+        else:
+            art = render_art(
+                seq,
+                ent,
+                kmers,
+                args.temperature,
+                args.noise_scale,
+                args.seed + idx,
+                args.max_grid_size,
+            )
 
         safe_id = "".join(ch if ch.isalnum() else "_" for ch in header.split()[0])[:80] or f"seq_{idx}"
         img_path = args.outdir / f"{idx:03d}_{safe_id}.png"
@@ -225,6 +320,7 @@ def main() -> None:
             noise_scale=args.noise_scale,
             top_n_kmers=args.top_n_kmers,
             seed=args.seed + idx,
+            esm2_model_path=str(esm2_model_path) if esm2_model_path else None,
             top_kmers=kmers[:10],
             output_image=str(img_path),
         )
